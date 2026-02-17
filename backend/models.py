@@ -19,6 +19,12 @@ class RequestStatusEnum(str, enum.Enum):
     REJECTED = "rejected"
 
 
+# NEW: Access type for vault access (read or write)
+class AccessTypeEnum(str, enum.Enum):
+    READ = "read"
+    WRITE = "write"
+
+
 class User(Base):
     __tablename__ = "users"
     
@@ -80,6 +86,17 @@ class AccessRequest(Base):
     admin_id = Column(UUID(as_uuid=True), ForeignKey("users.id"), nullable=False)
     vault_item_id = Column(UUID(as_uuid=True), ForeignKey("vault_items.id"), nullable=False)
     reason = Column(Text, nullable=False)
+    # NEW: Access type (read or write)
+    access_type = Column(
+        Enum(
+            AccessTypeEnum,
+            name="accesstypeenum",
+            native_enum=True,
+            values_callable=lambda enum_cls: [e.value for e in enum_cls]
+        ),
+        nullable=False,
+        default=AccessTypeEnum.READ  # Default to read for backward compatibility
+    )
     status = Column(
         Enum(
             RequestStatusEnum,
@@ -105,6 +122,17 @@ class PrivilegeSession(Base):
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     user_id = Column(UUID(as_uuid=True), ForeignKey("users.id"), nullable=False)
     vault_item_id = Column(UUID(as_uuid=True), ForeignKey("vault_items.id"), nullable=False)
+    # NEW: Track what type of access this session grants
+    access_type = Column(
+        Enum(
+            AccessTypeEnum,
+            name="accesstypeenum",
+            native_enum=True,
+            values_callable=lambda enum_cls: [e.value for e in enum_cls]
+        ),
+        nullable=False,
+        default=AccessTypeEnum.READ
+    )
     started_at = Column(DateTime, default=datetime.utcnow, nullable=False)
     expires_at = Column(DateTime, nullable=False)  # started_at + 3 minutes
     is_active = Column(Boolean, default=True, nullable=False)

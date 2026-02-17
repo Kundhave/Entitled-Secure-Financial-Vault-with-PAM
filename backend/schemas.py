@@ -2,7 +2,7 @@ from pydantic import BaseModel, Field
 from typing import Optional, List
 from datetime import datetime
 from uuid import UUID
-from models import RoleEnum, RequestStatusEnum
+from models import RoleEnum, RequestStatusEnum, AccessTypeEnum
 
 
 # Auth schemas
@@ -62,6 +62,7 @@ class VaultRecordDecrypted(BaseModel):
 class VaultItemWithRecords(BaseModel):
     vault_item: VaultItemResponse
     records: List[VaultRecordDecrypted]
+    session_id: UUID
 
 
 # Access Request schemas
@@ -69,6 +70,7 @@ class AccessRequestCreate(BaseModel):
     vault_item_id: UUID
     admin_id: UUID
     reason: str
+    access_type: AccessTypeEnum = AccessTypeEnum.READ  # NEW: Default to read
 
 
 class AccessRequestResponse(BaseModel):
@@ -80,6 +82,7 @@ class AccessRequestResponse(BaseModel):
     vault_item_id: UUID
     vault_item_title: str
     reason: str
+    access_type: AccessTypeEnum = AccessTypeEnum.READ  # NEW: Access type (Default to READ for backward compatibility)
     status: RequestStatusEnum
     created_at: datetime
     decided_at: Optional[datetime]
@@ -103,12 +106,16 @@ class PrivilegeSessionResponse(BaseModel):
     id: UUID
     user_id: UUID
     vault_item_id: UUID
+    access_type: AccessTypeEnum = AccessTypeEnum.READ  # NEW: Track session access type (Default to READ)
     started_at: datetime
     expires_at: datetime
     is_active: bool
     
     class Config:
         from_attributes = True
+
+class EndSessionRequest(BaseModel):
+    session_id: UUID
 
 
 # Audit Log schemas
@@ -132,3 +139,24 @@ class AuditLogResponse(BaseModel):
 class QRCodeResponse(BaseModel):
     qr_code_base64: str
     secret: str  # For manual entry in authenticator
+
+
+# NEW: Vault Record Create schema for write operations
+class VaultRecordCreate(BaseModel):
+    """Schema for creating new vault records (write access)"""
+    investment_name: str
+    invested_amount: float = Field(gt=0, description="Amount must be positive")
+    investment_date: str  # ISO format date
+    instrument_type: str
+    remarks: str
+    
+    class Config:
+        json_schema_extra = {
+            "example": {
+                "investment_name": "Tech Stock Portfolio",
+                "invested_amount": 50000.00,
+                "investment_date": "2026-01-15",
+                "instrument_type": "Equity",
+                "remarks": "Diversified tech investment"
+            }
+        }

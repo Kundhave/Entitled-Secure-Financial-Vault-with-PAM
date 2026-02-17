@@ -2,7 +2,7 @@ from fastapi import FastAPI, Depends, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session
 from database import get_db
-from models import User, VaultItem, VaultRecord, AccessRequest, PrivilegeSession, AuditLog, RoleEnum, RequestStatusEnum
+from models import User, VaultItem, VaultRecord, AccessRequest, PrivilegeSession, AuditLog, RoleEnum, RequestStatusEnum, AccessTypeEnum
 from schemas import *
 from security import (
     hash_password, verify_password, create_access_token,
@@ -171,6 +171,13 @@ def access_vault_item(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail="No approved access request for this vault item"
             )
+        
+        # NEW: Use the access type from the approved request
+        session_access_type = approved_request.access_type
+    else:
+        # Admins default to READ access unless explicitly specified
+        # (Admins can write directly without requests, but still need MFA)
+        session_access_type = AccessTypeEnum.READ
     
     # Create privilege session
     now = datetime.utcnow()
@@ -179,6 +186,7 @@ def access_vault_item(
     privilege_session = PrivilegeSession(
         user_id=current_user.id,
         vault_item_id=request.vault_item_id,
+        access_type=session_access_type,  # NEW: Store access type in session
         started_at=now,
         expires_at=expires_at,
         is_active=True
@@ -191,7 +199,7 @@ def access_vault_item(
         current_user,
         "VAULT_ACCESS_GRANTED",
         vault_item_id=request.vault_item_id,
-        metadata={"session_id": str(privilege_session.id)}
+        metadata={"session_id": str(privilege_session.id), "access_type": session_access_type.value}  # NEW: Include access type
     )
     
     db.commit()
@@ -210,7 +218,8 @@ def access_vault_item(
     
     return VaultItemWithRecords(
         vault_item=vault_item,
-        records=decrypted_records
+        records=decrypted_records,
+        session_id=privilege_session.id
     )
 
 
@@ -250,6 +259,152 @@ def check_privilege_session(
             "has_active_session": False
         }
 
+@app.post("/api/vault/end-session")
+def end_privilege_session(
+    request: EndSessionRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """Explicitly end a user's active privilege session."""
+    session = db.query(PrivilegeSession).filter(
+        PrivilegeSession.id == request.session_id,
+        PrivilegeSession.user_id == current_user.id
+    ).first()
+
+    if not session:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Privilege session not found"
+        )
+
+    if not session.is_active:
+        return {"message": "Session already inactive"}
+
+    session.is_active = False
+
+    create_audit_log(
+        db,
+        current_user,
+        "VAULT_ACCESS_ENDED",
+        vault_item_id=session.vault_item_id,
+        metadata={"session_id": str(session.id), "reason": "client_disconnect"}
+    )
+    
+    db.commit()
+    return {"message": "Privilege session ended"}
+
+
+# NEW: Write access endpoint for adding vault records
+@app.post("/api/vault/{vault_item_id}/records")
+def create_vault_record(
+    vault_item_id: str,
+    record_data: VaultRecordCreate,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """
+    Add a new record to an existing vault item (WRITE access).
+    
+    Security checks:
+    - User must be employee OR admin
+    - Must have active privilege session for this vault
+    - Privilege session must grant WRITE access (or user is admin)
+    - MFA already verified (via privilege session creation)
+    - Session must not be expired
+    """
+    # 1. Only employees and admins can write
+    if current_user.role == RoleEnum.AUDITOR:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Auditors cannot write vault data"
+        )
+    
+    # 2. Verify vault item exists
+    vault_item = db.query(VaultItem).filter(VaultItem.id == vault_item_id).first()
+    if not vault_item:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Vault item not found"
+        )
+    
+    # 3. Check for active privilege session
+    now = datetime.utcnow()
+    active_session = db.query(PrivilegeSession).filter(
+        PrivilegeSession.user_id == current_user.id,
+        PrivilegeSession.vault_item_id == vault_item_id,
+        PrivilegeSession.is_active == True,
+        PrivilegeSession.expires_at > now
+    ).first()
+    
+    if not active_session:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="No active privilege session. Please verify MFA first."
+        )
+    
+    # 4. Verify write access permission
+    # Employees need explicit WRITE access, admins can always write
+    if current_user.role == RoleEnum.EMPLOYEE:
+        if active_session.access_type != AccessTypeEnum.WRITE:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Your access request was approved for READ only. Request WRITE access to add records."
+            )
+    
+    # 5. Validate and prepare data
+    try:
+        # Convert Pydantic model to dict
+        record_dict = {
+            "investment_name": record_data.investment_name,
+            "invested_amount": record_data.invested_amount,
+            "investment_date": record_data.investment_date,
+            "instrument_type": record_data.instrument_type,
+            "remarks": record_data.remarks
+        }
+        
+        # Convert to JSON string
+        json_payload = json.dumps(record_dict)
+        
+        # Encrypt the payload using existing AES-256-GCM encryption
+        from security import encrypt_data
+        encrypted_payload = encrypt_data(json_payload)
+        
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Data validation or encryption failed: {str(e)}"
+        )
+    
+    # 6. Create new vault record
+    new_record = VaultRecord(
+        vault_item_id=vault_item_id,
+        encrypted_payload=encrypted_payload
+    )
+    db.add(new_record)
+    
+    # 7. Create audit log for write operation
+    create_audit_log(
+        db,
+        current_user,
+        "WRITE_RECORD",
+        vault_item_id=vault_item_id,
+        metadata={
+            "record_id": str(new_record.id),
+            "session_id": str(active_session.id),
+            "investment_name": record_data.investment_name,  # Non-sensitive metadata
+            "instrument_type": record_data.instrument_type
+        }
+    )
+    
+    db.commit()
+    
+    return {
+        "message": "Record added successfully",
+        "record_id": str(new_record.id),
+        "vault_item_id": str(vault_item_id)
+    }
+
+
 
 # ==================== ACCESS REQUEST ENDPOINTS ====================
 
@@ -282,6 +437,7 @@ def create_access_request(
         admin_id=request.admin_id,
         vault_item_id=request.vault_item_id,
         reason=request.reason,
+        access_type=request.access_type,  # CRITICAL: Store the requested access type
         status=RequestStatusEnum.PENDING # Explicitly set status
     )
     db.add(access_request)
@@ -322,6 +478,7 @@ def get_my_requests(
             vault_item_id=req.vault_item_id,
             vault_item_title=req.vault_item.title,
             reason=req.reason,
+            access_type=req.access_type,
             status=req.status,
             created_at=req.created_at,
             decided_at=req.decided_at
@@ -352,6 +509,7 @@ def get_pending_requests(
             vault_item_id=req.vault_item_id,
             vault_item_title=req.vault_item.title,
             reason=req.reason,
+            access_type=req.access_type,
             status=req.status,
             created_at=req.created_at,
             decided_at=req.decided_at
