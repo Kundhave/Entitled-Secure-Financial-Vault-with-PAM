@@ -15,9 +15,9 @@ ENTITLED is a cybersecurity-focused full-stack application implementing a **Zero
 
 ---
 
-## 🏗️ Architecture
+## 🏗️ Flow Diagram
 
-[Role_Flow.png]
+![Architecture Diagram](Role_Flow.png)
 
 ### Tech Stack
 
